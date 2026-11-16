@@ -1,15 +1,17 @@
 """Twitch Helix API wrappers used by the bot.
 
-Covers: custom reward create/get, redemption get/update, send chat message.
-All require a user access token with channel:manage:redemptions (and
-channel:read:redemptions for reading).
+Covers: custom reward create/get, redemption get/update, send chat message,
+and EventSub subscription creation.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger("twitch_musicbot.api")
 
 BASE = "https://api.twitch.tv/helix"
 
@@ -28,6 +30,43 @@ class TwitchAPI:
         headers["Client-Id"] = self.client_id
         headers["Content-Type"] = "application/json"
         return headers
+
+    # ---------------------------------------------------------------- EventSub
+
+    def create_eventsub_subscription(
+        self,
+        sub_type: str,
+        version: str,
+        condition: dict[str, Any],
+        session_id: str,
+    ) -> dict[str, Any]:
+        """Create an EventSub subscription linked to a WebSocket session."""
+        payload = {
+            "type": sub_type,
+            "version": version,
+            "condition": condition,
+            "transport": {
+                "method": "websocket",
+                "session_id": session_id,
+            },
+        }
+        resp = httpx.post(
+            f"{BASE}/eventsub/subscriptions",
+            headers=self._headers(),
+            json=payload,
+            timeout=30.0,
+        )
+        if resp.status_code == 409:
+            # Already subscribed to this condition for this session
+            logger.info("Подписка EventSub %s уже существует для сессии %s", sub_type, session_id)
+            return resp.json().get("data", [{}])[0]
+        if resp.status_code not in (200, 202):
+            raise TwitchAPIError(
+                f"Не удалось создать подписку EventSub {sub_type}: {resp.status_code} {resp.text}"
+            )
+        data = resp.json()["data"][0]
+        logger.info("EventSub подписка создана: %s (id=%s)", sub_type, data.get("id"))
+        return data
 
     # ---------------------------------------------------------------- rewards
 
@@ -139,6 +178,8 @@ class TwitchAPI:
         message: str,
     ) -> bool:
         """Send a chat message as the bot. Returns True if sent."""
+        if not broadcaster_id or not sender_id or not message.strip():
+            return False
         resp = httpx.post(
             f"{BASE}/chat/messages",
             headers=self._headers(),
@@ -149,7 +190,10 @@ class TwitchAPI:
             },
             timeout=30.0,
         )
-        if resp.status_code not in (200, 204):
-            return False
-        data = resp.json()
-        return bool(data.get("data", [{}])[0].get("is_sent", False))
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                return bool(data.get("data", [{}])[0].get("is_sent", False))
+            except Exception:
+                return False
+        return False

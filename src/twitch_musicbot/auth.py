@@ -10,11 +10,14 @@ stores both tokens in tokens.json.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger("twitch_musicbot.auth")
 
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 DEVICE_URL = "https://id.twitch.tv/oauth2/device"
@@ -81,32 +84,44 @@ class TwitchAuth:
             },
             timeout=30.0,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise AuthError(f"Ошибка запроса device code: {resp.status_code} {resp.text}")
         return resp.json()
 
     def poll_for_token(self, device_code: str, interval: int) -> dict[str, Any]:
         """Exchange device code for tokens. Blocks until user authorizes or expires."""
+        data_payload: dict[str, Any] = {
+            "client_id": self.client_id,
+            "device_code": device_code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        }
+        if self.client_secret:
+            data_payload["client_secret"] = self.client_secret
+
         while True:
             resp = httpx.post(
                 TOKEN_URL,
-                data={
-                    "client_id": self.client_id,
-                    "device_code": device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                },
+                data=data_payload,
                 timeout=30.0,
             )
             if resp.status_code == 400:
-                error = resp.json().get("error", "")
-                if error == "authorization_pending":
+                try:
+                    body = resp.json()
+                except Exception:
+                    body = {}
+                # Twitch returns {"status": 400, "message": "authorization_pending"}
+                # or {"error": "authorization_pending"}
+                msg = (body.get("message") or body.get("error") or "").lower()
+                if "authorization_pending" in msg:
                     time.sleep(interval)
                     continue
-                if error in ("slow_down",):
+                if "slow_down" in msg:
                     time.sleep(interval + 1)
                     continue
                 resp.raise_for_status()
             resp.raise_for_status()
             break
+
         data = resp.json()
         self.access_token = data["access_token"]
         self.refresh_token = data.get("refresh_token")
@@ -143,24 +158,28 @@ class TwitchAuth:
         """Refresh the access token using the stored refresh token."""
         if not self.refresh_token:
             raise AuthError("Нет refresh token. Запустите авторизацию заново.")
+        data: dict[str, Any] = {
+            "client_id": self.client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+        }
+        if self.client_secret:
+            data["client_secret"] = self.client_secret
+
         resp = httpx.post(
             TOKEN_URL,
-            data={
-                "client_id": self.client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": self.refresh_token,
-            },
+            data=data,
             timeout=30.0,
         )
         if resp.status_code != 200:
             raise AuthError(f"Не удалось обновить токен: {resp.status_code} {resp.text}")
-        data = resp.json()
-        self.access_token = data["access_token"]
-        # Twitch rotation: new refresh token may be issued
-        if "refresh_token" in data:
-            self.refresh_token = data["refresh_token"]
-        self.expires_at = time.time() + float(data.get("expires_in", 14400))
+        body = resp.json()
+        self.access_token = body["access_token"]
+        if "refresh_token" in body:
+            self.refresh_token = body["refresh_token"]
+        self.expires_at = time.time() + float(body.get("expires_in", 14400))
         self.save()
+        logger.info("Twitch access token успешно обновлен")
 
     def ensure_valid(self) -> None:
         """Ensure we have a valid access token, refreshing if needed."""
@@ -169,11 +188,11 @@ class TwitchAuth:
                 try:
                     self.refresh()
                     return
-                except AuthError:
-                    pass
+                except AuthError as e:
+                    logger.warning("Ошибка при автоматическом обновлении токена: %s", e)
             raise AuthError(
-                "Токен истек и не может быть обновлен. Запустите бота заново для "
-                "пройти Device Code Flow."
+                "Токен истек и не может быть обновлен. Запустите бота заново, "
+                "чтобы пройти авторизацию."
             )
 
     def validate(self) -> dict[str, Any] | None:

@@ -1,6 +1,7 @@
-"""Optional Twitch chat announcements (now playing, skip, refund).
+"""Twitch chat announcements (now playing, skip, refund).
 
-Fire-and-forget: schedules a coroutine on the running event loop.
+Fire-and-forget: schedules a task on the running event loop and executes
+the blocking network call in an executor to avoid stalling the loop.
 """
 
 from __future__ import annotations
@@ -19,18 +20,21 @@ class Chat:
         self.enabled = enabled
 
     async def announce(self, message: str) -> None:
-        if not self.enabled:
+        if not self.enabled or not self.broadcaster_id or not self.bot_user_id:
             return
         try:
-            sent = self.api.send_message(
+            loop = asyncio.get_running_loop()
+            sent = await loop.run_in_executor(
+                None,
+                self.api.send_message,
                 self.broadcaster_id,
                 self.bot_user_id,
                 message,
             )
             if not sent:
-                logger.warning("Чат-сообщение не доставлено: %s", message)
+                logger.debug("Сообщение в чат не отправлено: %s", message)
         except Exception:  # noqa: BLE001
-            logger.exception("Не удалось отправить сообщение в чат")
+            logger.exception("Ошибка при отправке сообщения в чат")
 
     def now_playing(self, title: str, requester: str, position: int | None = None) -> None:
         if position:
@@ -46,12 +50,11 @@ class Chat:
         self._fire(f"↩ Возврат баллов: {title} ({requester}) — {reason}")
 
     def _fire(self, message: str) -> None:
-        """Schedule announce() on the running event loop, if any."""
+        """Schedule announce() on the running event loop."""
         if not self.enabled:
             return
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.announce(message))
         except RuntimeError:
-            # No running loop — message is dropped (acceptable for fire-and-forget)
-            logger.debug("Нет цикла событий, сообщение в чат пропущено: %s", message)
+            logger.debug("Нет активного цикла событий, сообщение пропущено: %s", message)

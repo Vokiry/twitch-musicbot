@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
-import sys
 from pathlib import Path
 
 from .api import TwitchAPI, TwitchAPIError
@@ -18,15 +16,11 @@ from .chat import Chat
 from .config import Config, resolve_state_dir
 from .eventsub import EventSubClient
 from .kopuz import Kopuz
-from .player import Player, PlayerError, Track
+from .player import Player, PlayerError, Track, extract_youtube_video_id
 from .queue import Queue, QueuedTrack
 from .state import PauseState
 
 logger = logging.getLogger("twitch_musicbot.main")
-
-YOUTUBE_URL_RE = re.compile(
-    r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)[A-Za-z0-9_-]{11}"
-)
 
 
 class MusicBot:
@@ -69,11 +63,11 @@ class MusicBot:
     # ------------------------------------------------------------------ startup
 
     async def startup(self) -> None:
-        logger.info("=== Twitch Music Bot старт ===")
+        logger.info("=== Запуск Twitch Music Bot ===")
 
         # 1. Auth
         if not self.auth.load():
-            logger.info("Нет сохранённых токенов — запускаю Device Code Flow.")
+            logger.info("Нет сохранённых токенов — запуск Device Code Flow...")
             self.auth.authorize_interactive()
         else:
             self.auth.ensure_valid()
@@ -81,12 +75,12 @@ class MusicBot:
         info = self.auth.validate()
         if info:
             self._bot_user_id = info.get("user_id") or info.get("login")
-            logger.info("Авторизован как %s", self._bot_user_id)
+            logger.info("Авторизован аккаунт Twitch: %s", self._bot_user_id)
 
-        # 2. Fail-open: if we previously paused Kopuz and are restarting,
+        # 2. Fail-open: if we previously paused Kopuz and crashed/restarted,
         #    resume it so the stream isn't left silent.
         if self.pause_state.get():
-            logger.warning("Обнаружен флаг paused_by_us после перезапуска — снимаю паузу с Kopuz.")
+            logger.warning("Обнаружен флаг paused_by_us после перезапуска — снимаю Kopuz с паузы.")
             self.kopuz.play()
             self.pause_state.clear()
 
@@ -94,15 +88,15 @@ class MusicBot:
         self._reward_id = await asyncio.get_event_loop().run_in_executor(
             None, self._ensure_reward
         )
-        logger.info("Награда: %s", self._reward_id or "(не найдена / не создана)")
+        logger.info("ID награды за баллы: %s", self._reward_id or "(не найдена / не создана)")
 
         # 4. Resume persisted queue (if any)
         queue_file = self.state_dir / "queue.json"
         if queue_file.exists():
             self.queue = Queue.load(queue_file, self.cfg)
-            logger.info("Очередь восстановлена: %d треков", self.queue.count())
+            logger.info("Очередь восстановлена с диска: %d треков", self.queue.count())
 
-        # 5. Check tooling
+        # 5. Check tooling availability
         missing = []
         for name, path in (
             ("mpv", self.cfg.mpv),
@@ -112,13 +106,13 @@ class MusicBot:
             if not self.player.tool_available(path):
                 missing.append(f"{name} ({path})")
         if missing:
-            logger.warning("Не найдены инструменты: %s. bot будет работать некорректно.", ", ".join(missing))
+            logger.warning("Не найдены исполняемые файлы: %s. Проверьте пути в config.json.", ", ".join(missing))
 
     def _ensure_reward(self) -> str | None:
         """Find the bot's reward by title, or create it. Returns reward ID."""
         broadcaster = self.cfg.broadcaster_user_id
         if not broadcaster:
-            logger.error("broadcaster_user_id не задан в конфиге.")
+            logger.error("broadcaster_user_id не задан в конфигурации.")
             return None
 
         try:
@@ -129,7 +123,7 @@ class MusicBot:
 
         for r in rewards:
             if r.get("title") == self.cfg.reward_title:
-                logger.info("Награда уже существует: %s", r["id"])
+                logger.info("Награда '%s' найдена: %s", self.cfg.reward_title, r["id"])
                 return r["id"]
 
         try:
@@ -146,11 +140,28 @@ class MusicBot:
                 should_redemptions_skip_request_queue=self.cfg.reward_should_redemptions_skip_request_queue,
             )
             rid = created["id"]
-            logger.info("Создана новая награда: %s (цена %s баллов)", rid, self.cfg.reward_cost)
+            logger.info("Создана новая награда '%s': %s (цена %d баллов)", self.cfg.reward_title, rid, self.cfg.reward_cost)
             return rid
         except TwitchAPIError as e:
-            logger.error("Не удалось создать награду: %s", e)
+            logger.error("Не удалось создать награду в Twitch: %s", e)
             return None
+
+    # ---------------------------------------------------------------- EventSub registration
+
+    async def _on_eventsub_welcome(self, session_id: str) -> None:
+        """Called when EventSub sends session_welcome. Registers the subscription via Helix REST API."""
+        cond = {"broadcaster_user_id": self.cfg.broadcaster_user_id}
+        if self._reward_id:
+            cond["reward_id"] = self._reward_id
+
+        await asyncio.get_event_loop().run_in_executor(
+            None,
+            self.api.create_eventsub_subscription,
+            "channel.channel_points_custom_reward_redemption.add",
+            "1",
+            cond,
+            session_id,
+        )
 
     # ---------------------------------------------------------------- redemption processing
 
@@ -168,33 +179,32 @@ class MusicBot:
         rid = redemption.get("id", "")
         reward_id = redemption.get("reward", {}).get("id", "")
         if self._reward_id and reward_id != self._reward_id:
-            return  # ignore redemptions for other rewards
+            return  # ignore redemptions for other channel point rewards
 
         user_id = redemption.get("user_id", "")
         user_login = redemption.get("user_login", "")
         user_name = redemption.get("user_name", "")
         user_input = redemption.get("user_input", "")
 
-        # Validate input
-        if not user_input or not YOUTUBE_URL_RE.match(user_input.strip()):
-            reason = "Нужен прямой URL на YouTube (youtube.com/watch?v=... или youtu.be/...)."
+        # 1. Validate YouTube URL
+        video_id = extract_youtube_video_id(user_input)
+        if not video_id:
+            reason = "Нужна прямая ссылка на YouTube видео (youtube.com или youtu.be)."
             await self._refund_redemption(rid, reward_id, user_name, reason)
             return
 
-        url = user_input.strip()
-        if not url.startswith("http"):
-            url = "https://" + url
+        normalized_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        # Capacity checks
-        ok, reason = self.queue.can_add(user_id, url)
+        # 2. Capacity & limit checks
+        ok, reason = self.queue.can_add(user_id, normalized_url)
         if not ok:
             await self._refund_redemption(rid, reward_id, user_name, reason)
             return
 
-        # Resolve track via yt-dlp
+        # 3. Resolve metadata via yt-dlp
         try:
             track = await asyncio.get_event_loop().run_in_executor(
-                None, self.player.resolve, url
+                None, self.player.resolve, normalized_url
             )
         except PlayerError as e:
             await self._refund_redemption(rid, reward_id, user_name, str(e))
@@ -202,25 +212,27 @@ class MusicBot:
 
         if track is None:
             await self._refund_redemption(
-                rid, reward_id, user_name, "Трек недоступен или это трансляция."
+                rid, reward_id, user_name, "Видео недоступно или является трансляцией."
             )
             return
 
-        # Duration limit
+        # 4. Duration limit
         if (
             self.cfg.max_track_seconds > 0
             and track.duration_seconds is not None
             and track.duration_seconds > self.cfg.max_track_seconds
         ):
+            max_mins = self.cfg.max_track_seconds // 60
+            track_mins = track.duration_seconds // 60
             await self._refund_redemption(
                 rid,
                 reward_id,
                 user_name,
-                f"Трек слишком длинный ({track.duration_seconds // 60} мин, лимит {self.cfg.max_track_seconds // 60} мин).",
+                f"Трек слишком длинный ({track_mins} мин, лимит {max_mins} мин).",
             )
             return
 
-        # Enqueue
+        # 5. Enqueue
         item = QueuedTrack(
             track_title=track.title,
             track_url=track.url,
@@ -233,11 +245,10 @@ class MusicBot:
         pos = self.queue.add(item)
         self.queue.save(self.state_dir / "queue.json")
 
-        # Chat announce
-        chat_msg = f"✅ {user_name} заказал: {track.title} (очередь #{pos})"
+        chat_msg = f"✅ {user_name} заказал: {track.title} (позиция в очереди #{pos})"
         self._schedule_chat(chat_msg)
 
-        # If nothing is playing, start playback (which pauses Kopuz)
+        # 6. Trigger playback if idle
         if not self._playing:
             asyncio.create_task(self._playback_loop())
 
@@ -257,77 +268,64 @@ class MusicBot:
                 [redemption_id],
                 "CANCELED",
             )
-            logger.info("Редемпшен %s отменён, баллы возвращены: %s", redemption_id, reason)
-            self._schedule_chat(f"↩ {user_name}, баллы возвращены: {reason}")
+            logger.info("Заказ %s отменён, баллы возвращены (%s): %s", redemption_id, user_name, reason)
+            self._schedule_chat(f"↩ @{user_name}, баллы возвращены: {reason}")
         except TwitchAPIError as e:
-            logger.error("Не удалось отменить редемпшен %s: %s", redemption_id, e)
+            logger.error("Не удалось вернуть баллы за заказ %s: %s", redemption_id, e)
 
     # ---------------------------------------------------------------- playback loop
 
     async def _playback_loop(self) -> None:
-        """Play queued tracks one by one. Pauses Kopuz while any track plays.
+        """Play queued tracks one by one. Pauses Kopuz while any track plays."""
+        if self._playing:
+            return
 
-        Runs continuously while the bot is active. When the queue empties it
-        waits the debounce delay, then resumes Kopuz if nothing new arrived.
-        If a request arrives during the debounce, Kopuz stays paused and the
-        new track is played.
-        """
         self._playing = True
         self._playback_task = asyncio.current_task()
-        if self.cfg.pause_kopuz_during_request:
-            self.kopuz.pause()
-            self.pause_state.set(True)
 
         try:
             while self._running:
                 item = self.queue.pop_next()
                 if item is None:
-                    # Queue empty. If we paused Kopuz, wait debounce then resume.
+                    # Queue is empty: wait for debounce delay before unpausing Kopuz
                     if self.pause_state.get():
                         await asyncio.sleep(self.cfg.resume_debounce_seconds)
-                        if (
-                            self.queue.is_empty()
-                            and self.pause_state.get()
-                            and self._running
-                        ):
+                        # Check if a new track arrived during the debounce sleep
+                        if self.queue.is_empty():
                             self.kopuz.play()
                             self.pause_state.clear()
                             self.queue.save(self.state_dir / "queue.json")
-                            self._schedule_chat(
-                                "▶ Очередь пуста, локальная музыка продолжена."
-                            )
+                            self._schedule_chat("▶ Очередь заказов пуста, локальная музыка возобновлена.")
+                            break
+                        else:
+                            continue
                     else:
-                        await asyncio.sleep(0.5)
-                    continue
+                        break
 
                 track = Track(
                     url=item.track_url,
                     title=item.track_title,
                     duration_seconds=item.duration_seconds,
-                    source="queue",
+                    source="url",
                     requester=item.requester_name,
                     requester_login=item.requester_login,
                 )
 
-                self._schedule_chat(
-                    f"▶ Сейчас играет: {track.title} — заказал {item.requester_name}"
-                )
-
-                # Ensure Kopuz is paused for this track (it may have been
-                # resumed while the queue was empty).
-                if (
-                    self.cfg.pause_kopuz_during_request
-                    and not self.pause_state.get()
-                ):
+                # Ensure Kopuz is paused
+                if self.cfg.pause_kopuz_during_request and not self.pause_state.get():
                     self.kopuz.pause()
                     self.pause_state.set(True)
 
+                self._schedule_chat(
+                    f"▶ Сейчас играет: {track.title} (заказ от {item.requester_name})"
+                )
+
                 try:
-                    code = await asyncio.get_event_loop().run_in_executor(
+                    await asyncio.get_event_loop().run_in_executor(
                         None, self.player.play, track
                     )
                 except PlayerError as e:
-                    logger.error("Ошибка воспроизведения %s: %s", track.title, e)
+                    logger.error("Ошибка воспроизведения трека '%s': %s", track.title, e)
                     await self._refund_redemption(
                         item.redemption_id,
                         self._reward_id or "",
@@ -336,22 +334,26 @@ class MusicBot:
                     )
                     continue
 
-                # Track finished naturally — mark redemption fulfilled
+                # Finished playing normally: fulfill redemption on Twitch
                 if item.redemption_id and self._reward_id:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        self.api.update_redemption,
-                        self.cfg.broadcaster_user_id,
-                        self._reward_id,
-                        [item.redemption_id],
-                        "FULFILLED",
-                    )
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            self.api.update_redemption,
+                            self.cfg.broadcaster_user_id,
+                            self._reward_id,
+                            [item.redemption_id],
+                            "FULFILLED",
+                        )
+                    except Exception as e:
+                        logger.warning("Не удалось отметить заказ %s как исполненный: %s", item.redemption_id, e)
+
                 self.queue.save(self.state_dir / "queue.json")
         finally:
             self._playing = False
             self._playback_task = None
-            # On shutdown, make sure Kopuz is not left paused
-            if self.cfg.pause_kopuz_during_request and self.pause_state.get():
+            # If shutting down while Kopuz was paused, ensure it's resumed
+            if not self._running and self.cfg.pause_kopuz_during_request and self.pause_state.get():
                 self.kopuz.play()
                 self.pause_state.clear()
 
@@ -359,7 +361,7 @@ class MusicBot:
         if self.chat:
             self.chat._fire(message)
 
-    # ---------------------------------------------------------------- eventsub wiring
+    # ---------------------------------------------------------------- main life-cycle
 
     async def _on_eventsub_redemption(self, event: dict) -> None:
         await self.redemption_queue.put(event)
@@ -368,21 +370,28 @@ class MusicBot:
         self._running = True
         await self.startup()
 
-        self.chat = Chat(self.api, self.cfg.broadcaster_user_id, self._bot_user_id or "", self.cfg.announce_in_chat)
+        self.chat = Chat(
+            self.api,
+            self.cfg.broadcaster_user_id,
+            self._bot_user_id or "",
+            self.cfg.announce_in_chat,
+        )
 
-        # Start redemption processor
+        # 1. Start redemption processor
         self._processor_task = asyncio.create_task(self._process_redemptions())
 
-        # Start EventSub client
+        # 2. Start EventSub WebSocket client
         self._eventsub = EventSubClient(
-            access_token_getter=lambda: self.auth.access_token or "",
-            broadcaster_user_id=self.cfg.broadcaster_user_id,
-            reward_id=self._reward_id,
+            on_session_welcome=self._on_eventsub_welcome,
             on_redemption=self._on_eventsub_redemption,
         )
         self._eventsub_task = asyncio.create_task(self._eventsub.run())
 
-        logger.info("Бот готов. Ожидаю заказы...")
+        # 3. If persisted queue has tracks from earlier, start playing them immediately
+        if not self.queue.is_empty() and not self._playing:
+            asyncio.create_task(self._playback_loop())
+
+        logger.info("✓ Бот успешно запущен и ожидает заказов.")
         try:
             while self._running:
                 await asyncio.sleep(1)

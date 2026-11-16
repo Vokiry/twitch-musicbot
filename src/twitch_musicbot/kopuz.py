@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-from pathlib import Path
+import sys
 
 logger = logging.getLogger("twitch_musicbot.kopuz")
 
@@ -23,50 +23,61 @@ class Kopuz:
     def __init__(self, kopuzctl_path: str) -> None:
         self.kopuzctl = kopuzctl_path
 
-    def _run(self, *args: str, timeout: int = 10) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            [self.kopuzctl, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+    def _run(self, *args: str, timeout: int = 10) -> subprocess.CompletedProcess | None:
+        kwargs = {}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            return subprocess.run(
+                [self.kopuzctl, *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                **kwargs,
+            )
+        except FileNotFoundError:
+            logger.warning("kopuzctl не найден по пути '%s'", self.kopuzctl)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Ошибка при запуске kopuzctl %s: %s", " ".join(args), e)
+            return None
 
     def status(self) -> dict | None:
         """Return parsed `kopuzctl status --json` or None on failure."""
         proc = self._run("status", "--json")
-        if proc.returncode != 0:
-            logger.debug("kopuzctl status failed: %s", proc.stderr.strip())
+        if proc is None or proc.returncode != 0:
             return None
         try:
             return json.loads(proc.stdout)
         except json.JSONDecodeError:
-            logger.warning("kopuzctl status returned invalid JSON")
+            logger.warning("kopuzctl status вернул невалидный JSON")
             return None
 
     def is_playing(self) -> bool:
         state = self.status()
         if state is None:
             return False
-        # Kopuz player_state has a phase field; treat anything not stopped as playing
         phase = state.get("phase") if isinstance(state, dict) else None
         return phase not in (None, "stopped", "paused")
 
     def pause(self) -> bool:
         proc = self._run("pause")
-        if proc.returncode != 0:
-            logger.error("kopuzctl pause failed: %s", proc.stderr.strip())
+        if proc is None or proc.returncode != 0:
+            err = proc.stderr.strip() if proc else "файл не найден"
+            logger.warning("Не удалось поставить Kopuz на паузу: %s", err)
             return False
-        logger.info("Kopuz paused by bot")
+        logger.info("Kopuz поставлен на паузу")
         return True
 
     def play(self) -> bool:
         proc = self._run("play")
-        if proc.returncode != 0:
-            logger.error("kopuzctl play failed: %s", proc.stderr.strip())
+        if proc is None or proc.returncode != 0:
+            err = proc.stderr.strip() if proc else "файл не найден"
+            logger.warning("Не удалось снять Kopuz с паузы: %s", err)
             return False
-        logger.info("Kopuz resumed by bot")
+        logger.info("Kopuz снят с паузы")
         return True
 
     def toggle(self) -> bool:
         proc = self._run("toggle")
-        return proc.returncode == 0
+        return proc is not None and proc.returncode == 0

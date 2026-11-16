@@ -1,6 +1,6 @@
-"""Request queue with limits, cooldowns, de-dup and blocklist.
+"""Request queue with limits, cooldowns, de-dup and persistence.
 
-All limits come from Config and can be changed by the streamer in config.toml.
+All limits come from Config and can be changed by the streamer in config.json.
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger("twitch_musicbot.queue")
+
+DEDUP_WINDOW_SECONDS = 1800.0  # 30 minutes
 
 
 @dataclass
@@ -31,38 +33,39 @@ class Queue:
     def __init__(self, config) -> None:
         self.cfg = config
         self._items: list[QueuedTrack] = []
-        self._user_tracks: dict[str, list[int]] = {}  # user_id -> indices
+        self._user_tracks: dict[str, list[int]] = {}
         self._user_last_redeem: dict[str, float] = {}
-        self._recent_urls: dict[str, float] = {}  # url -> timestamp for dedup
-        self._blocked_users: set[str] = set()
-        self._blocked_terms: set[str] = set()
-
-    # ---------------------------------------------------------------- capacity
+        self._recent_urls: dict[str, float] = {}  # url -> timestamp
 
     def can_add(self, requester_id: str, url: str) -> tuple[bool, str]:
         """Check whether a new request may be enqueued. Returns (ok, reason)."""
         now = time.time()
 
-        # User cooldown
+        # 1. Clean up expired deduplication entries
+        expired = [u for u, ts in self._recent_urls.items() if now - ts > DEDUP_WINDOW_SECONDS]
+        for u in expired:
+            del self._recent_urls[u]
+
+        # 2. Duplicate URL check
+        if url in self._recent_urls:
+            return False, "Этот трек уже был заказан недавно."
+
+        # 3. Max tracks per user in queue
+        if self.cfg.max_per_user > 0:
+            user_count = len(self._user_tracks.get(requester_id, []))
+            if user_count >= self.cfg.max_per_user:
+                return False, f"У вас уже {user_count} треков в очереди (лимит {self.cfg.max_per_user})."
+
+        # 4. User cooldown
         if self.cfg.user_cooldown_seconds > 0:
             last = self._user_last_redeem.get(requester_id, 0)
             if now - last < self.cfg.user_cooldown_seconds:
                 remaining = int(self.cfg.user_cooldown_seconds - (now - last))
                 return False, f"Повторный заказ возможен через {remaining} с."
 
-        # Max per user in queue
-        if self.cfg.max_per_user > 0:
-            user_count = len(self._user_tracks.get(requester_id, []))
-            if user_count >= self.cfg.max_per_user:
-                return False, f"У вас уже {user_count} треков в очереди (лимит {self.cfg.max_per_user})."
-
-        # Max queue size
+        # 5. Max queue size
         if self.cfg.max_queue_size > 0 and len(self._items) >= self.cfg.max_queue_size:
             return False, f"Очередь заполнена ({self.cfg.max_queue_size} треков)."
-
-        # Duplicate URL in last N minutes
-        if url in self._recent_urls:
-            return False, "Этот трек уже был заказан недавно."
 
         return True, ""
 
@@ -76,7 +79,7 @@ class Queue:
         self._user_last_redeem[item.requester_id] = item.redeemed_at
         self._recent_urls[item.track_url] = item.redeemed_at
         logger.info(
-            "Queue add #%d %s by %s",
+            "В очередь добавлен трек #%d: '%s' (заказал %s)",
             position,
             item.track_title,
             item.requester_name,
@@ -88,11 +91,10 @@ class Queue:
         if not self._items:
             return None
         item = self._items.pop(0)
-        # Re-index user track references
         self._rebuild_user_index()
         for i, it in enumerate(self._items):
             it.position = i + 1
-        logger.info("Queue pop: %s (was #%d)", item.track_title, item.position)
+        logger.info("Из очереди извлечён трек: '%s'", item.track_title)
         return item
 
     def peek(self) -> QueuedTrack | None:
@@ -104,33 +106,10 @@ class Queue:
     def count(self) -> int:
         return len(self._items)
 
-    def skip_current(self) -> QueuedTrack | None:
-        """Alias for pop_next — used when skipping the currently playing request."""
-        return self.pop_next()
-
-    def clear_user(self, requester_id: str) -> int:
-        """Remove all queued tracks for a user (moderator action). Returns removed count."""
-        removed = 0
-        remaining = []
-        for it in self._items:
-            if it.requester_id == requester_id:
-                removed += 1
-            else:
-                remaining.append(it)
-        self._items = remaining
-        self._rebuild_user_index()
-        for i, it in enumerate(self._items):
-            it.position = i + 1
-        return removed
-
-    # ------------------------------------------------------------- internal
-
     def _rebuild_user_index(self) -> None:
         self._user_tracks = {}
         for i, it in enumerate(self._items):
             self._user_tracks.setdefault(it.requester_id, []).append(i)
-
-    # ------------------------------------------------------------- persistence
 
     def save(self, path: str | Path) -> None:
         data = {
@@ -150,7 +129,7 @@ class Queue:
             ]
         }
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
     def load(cls, path: str | Path, config) -> "Queue":

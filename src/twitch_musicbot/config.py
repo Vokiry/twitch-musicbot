@@ -9,9 +9,12 @@ hand-edited config.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("twitch_musicbot.config")
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "twitch": {
@@ -107,8 +110,12 @@ class Config:
         path = Path(path)
         data: dict[str, Any] = {}
         if path.exists():
-            with path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
+            try:
+                raw = path.read_text(encoding="utf-8").strip()
+                if raw:
+                    data = json.loads(raw)
+            except Exception as e:
+                logger.warning("Не удалось прочитать %s: %s. Используются дефолты.", path, e)
         merged = _deep_merge(DEFAULT_CONFIG, data)
         return cls.from_dict(merged)
 
@@ -133,17 +140,11 @@ class Config:
             reward_title=str(reward.get("title", "Заказ музыки")),
             reward_cost=int(reward.get("cost", 500)),
             reward_background_color=str(reward.get("background_color", "#9147FF")),
-            reward_is_user_input_required=bool(
-                reward.get("is_user_input_required", True)
-            ),
+            reward_is_user_input_required=bool(reward.get("is_user_input_required", True)),
             reward_prompt=str(reward.get("prompt", "Ссылка на YouTube-трек")),
             reward_max_per_stream=int(reward.get("max_per_stream", 0)),
-            reward_max_per_user_per_stream=int(
-                reward.get("max_per_user_per_stream", 0)
-            ),
-            reward_global_cooldown_seconds=int(
-                reward.get("global_cooldown_seconds", 0)
-            ),
+            reward_max_per_user_per_stream=int(reward.get("max_per_user_per_stream", 0)),
+            reward_global_cooldown_seconds=int(reward.get("global_cooldown_seconds", 0)),
             reward_should_redemptions_skip_request_queue=bool(
                 reward.get("should_redemptions_skip_request_queue", False)
             ),
@@ -151,14 +152,10 @@ class Config:
             max_queue_size=int(limits.get("max_queue_size", 20)),
             max_per_user=int(limits.get("max_per_user", 2)),
             user_cooldown_seconds=int(limits.get("user_cooldown_seconds", 60)),
-            resume_debounce_seconds=float(
-                limits.get("resume_debounce_seconds", 2.0)
-            ),
+            resume_debounce_seconds=float(limits.get("resume_debounce_seconds", 2.0)),
             yt_dlp_timeout_seconds=int(limits.get("yt_dlp_timeout_seconds", 20)),
             mpv_timeout_seconds=int(limits.get("mpv_timeout_seconds", 0)),
-            pause_kopuz_during_request=bool(
-                behavior.get("pause_kopuz_during_request", True)
-            ),
+            pause_kopuz_during_request=bool(behavior.get("pause_kopuz_during_request", True)),
             announce_in_chat=bool(behavior.get("announce_in_chat", True)),
             auto_refund_on_error=bool(behavior.get("auto_refund_on_error", True)),
             youtube_links_only=bool(behavior.get("youtube_links_only", True)),

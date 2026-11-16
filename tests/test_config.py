@@ -1,48 +1,66 @@
-"""Tests for config loading defaults."""
+"""Tests for configuration loading and defaults."""
 
-from pathlib import Path
+import json
 import tempfile
+import unittest
+from pathlib import Path
 
 from twitch_musicbot.config import Config, DEFAULT_CONFIG
 
 
-def test_defaults_load_from_empty_file():
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-        f.write("")
-        path = f.name
-    try:
-        cfg = Config.load(path)
-        assert cfg.reward_title == DEFAULT_CONFIG["reward"]["title"]
-        assert cfg.reward_cost == DEFAULT_CONFIG["reward"]["cost"]
-        assert cfg.max_track_seconds == DEFAULT_CONFIG["limits"]["max_track_seconds"]
-        assert cfg.max_queue_size == DEFAULT_CONFIG["limits"]["max_queue_size"]
-        assert cfg.pause_kopuz_during_request is True
-    finally:
-        Path(path).unlink()
+class TestConfig(unittest.TestCase):
+    def test_defaults_load_from_empty_or_missing_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("{}")
+            path = f.name
+        try:
+            cfg = Config.load(path)
+            self.assertEqual(cfg.reward_title, DEFAULT_CONFIG["reward"]["title"])
+            self.assertEqual(cfg.reward_cost, DEFAULT_CONFIG["reward"]["cost"])
+            self.assertEqual(cfg.max_track_seconds, DEFAULT_CONFIG["limits"]["max_track_seconds"])
+            self.assertEqual(cfg.max_queue_size, DEFAULT_CONFIG["limits"]["max_queue_size"])
+            self.assertTrue(cfg.pause_kopuz_during_request)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_defaults_load_from_blank_file(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            f.write("")
+            path = f.name
+        try:
+            cfg = Config.load(path)
+            self.assertEqual(cfg.reward_cost, 500)
+            self.assertEqual(cfg.max_queue_size, 20)
+        finally:
+            Path(path).unlink(missing_ok=True)
+
+    def test_override_values(self):
+        data = {
+            "reward": {
+                "title": "Мой трек",
+                "cost": 150,
+            },
+            "limits": {
+                "max_track_seconds": 600,
+                "max_queue_size": 5,
+            },
+            "behavior": {
+                "pause_kopuz_during_request": False,
+            },
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            cfg = Config.load(path)
+            self.assertEqual(cfg.reward_title, "Мой трек")
+            self.assertEqual(cfg.reward_cost, 150)
+            self.assertEqual(cfg.max_track_seconds, 600)
+            self.assertEqual(cfg.max_queue_size, 5)
+            self.assertFalse(cfg.pause_kopuz_during_request)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
-def test_override_values():
-    toml = """
-[reward]
-title = "Моя награда"
-cost = 123
-
-[limits]
-max_track_seconds = 600
-max_queue_size = 5
-
-[behavior]
-pause_kopuz_during_request = false
-"""
-    with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-        f.write(toml)
-        path = f.name
-    try:
-        cfg = Config.load(path)
-        assert cfg.reward_title == "Моя награда"
-        assert cfg.reward_cost == 123
-        assert cfg.max_track_seconds == 600
-        assert cfg.max_queue_size == 5
-        assert cfg.pause_kopuz_during_request is False
-    finally:
-        Path(path).unlink()
+if __name__ == "__main__":
+    unittest.main()
