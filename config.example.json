@@ -1,0 +1,42 @@
+{
+  "twitch": {
+    "client_id": "ВАШ_CLIENT_ID",
+    "client_secret": "ВАШ_CLIENT_SECRET",
+    "broadcaster_user_id": "123456789",
+    "scopes": "channel:read:redemptions channel:manage:redemptions user:write:chat",
+    "token_file": "tokens.json"
+  },
+  "paths": {
+    "mpv": "C:/tools/mpv.exe",
+    "yt_dlp": "C:/tools/yt-dlp.exe",
+    "kopuzctl": "C:/Program Files/Kopuz/kopuzctl.exe",
+    "state_dir": "./state",
+    "log_file": "./bot.log"
+  },
+  "reward": {
+    "title": "Заказ музыки",
+    "cost": 500,
+    "background_color": "#9147FF",
+    "is_user_input_required": true,
+    "prompt": "Ссылка на YouTube-трек",
+    "max_per_stream": 0,
+    "max_per_user_per_stream": 0,
+    "global_cooldown_seconds": 0,
+    "should_redemptions_skip_request_queue": false
+  },
+  "limits": {
+    "max_track_seconds": 360,
+    "max_queue_size": 20,
+    "max_per_user": 2,
+    "user_cooldown_seconds": 60,
+    "resume_debounce_seconds": 2.0,
+    "yt_dlp_timeout_seconds": 20,
+    "mpv_timeout_seconds": 0
+  },
+  "behavior": {
+    "pause_kopuz_during_request": true,
+    "announce_in_chat": true,
+    "auto_refund_on_error": true,
+    "youtube_links_only": true
+  }
+}

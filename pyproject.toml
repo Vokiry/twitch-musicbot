@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twitch-musicbot"
+version = "0.1.0"
+description = "Twitch channel-points music request bot that pauses Kopuz while a YouTube track plays"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Vokiry" }]
+license = { text = "MIT" }
+
+dependencies = [
+    "websockets>=12.0",
+    "httpx>=0.27.0",
+    "tomli>=2.0.1",
+    "tomli-w>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+twitch-musicbot = "twitch_musicbot.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+lint.select = ["E", "F", "B", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
