@@ -265,7 +265,13 @@ class MusicBot:
     # ---------------------------------------------------------------- playback loop
 
     async def _playback_loop(self) -> None:
-        """Play queued tracks one by one. Pauses Kopuz while any track plays."""
+        """Play queued tracks one by one. Pauses Kopuz while any track plays.
+
+        Runs continuously while the bot is active. When the queue empties it
+        waits the debounce delay, then resumes Kopuz if nothing new arrived.
+        If a request arrives during the debounce, Kopuz stays paused and the
+        new track is played.
+        """
         self._playing = True
         self._playback_task = asyncio.current_task()
         if self.cfg.pause_kopuz_during_request:
@@ -276,7 +282,23 @@ class MusicBot:
             while self._running:
                 item = self.queue.pop_next()
                 if item is None:
-                    break  # queue empty
+                    # Queue empty. If we paused Kopuz, wait debounce then resume.
+                    if self.pause_state.get():
+                        await asyncio.sleep(self.cfg.resume_debounce_seconds)
+                        if (
+                            self.queue.is_empty()
+                            and self.pause_state.get()
+                            and self._running
+                        ):
+                            self.kopuz.play()
+                            self.pause_state.clear()
+                            self.queue.save(self.state_dir / "queue.json")
+                            self._schedule_chat(
+                                "▶ Очередь пуста, локальная музыка продолжена."
+                            )
+                    else:
+                        await asyncio.sleep(0.5)
+                    continue
 
                 track = Track(
                     url=item.track_url,
@@ -287,7 +309,18 @@ class MusicBot:
                     requester_login=item.requester_login,
                 )
 
-                self._schedule_chat(f"▶ Сейчас играет: {track.title} — заказал {item.requester_name}")
+                self._schedule_chat(
+                    f"▶ Сейчас играет: {track.title} — заказал {item.requester_name}"
+                )
+
+                # Ensure Kopuz is paused for this track (it may have been
+                # resumed while the queue was empty).
+                if (
+                    self.cfg.pause_kopuz_during_request
+                    and not self.pause_state.get()
+                ):
+                    self.kopuz.pause()
+                    self.pause_state.set(True)
 
                 try:
                     code = await asyncio.get_event_loop().run_in_executor(
@@ -301,10 +334,9 @@ class MusicBot:
                         item.requester_name,
                         str(e),
                     )
-                    continue  # try next in queue
+                    continue
 
-                # Track finished naturally
-                # Mark redemption fulfilled
+                # Track finished naturally — mark redemption fulfilled
                 if item.redemption_id and self._reward_id:
                     await asyncio.get_event_loop().run_in_executor(
                         None,
@@ -315,29 +347,17 @@ class MusicBot:
                         "FULFILLED",
                     )
                 self.queue.save(self.state_dir / "queue.json")
-
-                if self.queue.is_empty():
-                    break  # exit loop, will resume Kopuz below
         finally:
             self._playing = False
-
-        # Queue empty — resume Kopuz after debounce
-        if self.cfg.pause_kopuz_during_request and self.pause_state.get():
-            await asyncio.sleep(self.cfg.resume_debounce_seconds)
-            # Double-check nothing was added while we slept
-            if self.queue.is_empty() and self.pause_state.get():
+            self._playback_task = None
+            # On shutdown, make sure Kopuz is not left paused
+            if self.cfg.pause_kopuz_during_request and self.pause_state.get():
                 self.kopuz.play()
                 self.pause_state.clear()
-                self.queue.save(self.state_dir / "queue.json")
-                self._schedule_chat("▶ Очередь пуста, локальная музыка продолжена.")
 
     def _schedule_chat(self, message: str) -> None:
-        if self.chat and self.cfg.announce_in_chat:
-            # fire-and-forget
-            try:
-                asyncio.get_event_loop().create_task(self.chat.announce(message))
-            except RuntimeError:
-                pass
+        if self.chat:
+            self.chat._fire(message)
 
     # ---------------------------------------------------------------- eventsub wiring
 

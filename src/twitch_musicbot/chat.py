@@ -1,7 +1,11 @@
-"""Optional Twitch chat announcements (now playing, skip, refund)."""
+"""Optional Twitch chat announcements (now playing, skip, refund).
+
+Fire-and-forget: schedules a coroutine on the running event loop.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger("twitch_musicbot.chat")
@@ -33,25 +37,21 @@ class Chat:
             msg = f"▶ Сейчас играет: {title} — заказал {requester} (в очереди ещё {position})"
         else:
             msg = f"▶ Сейчас играет: {title} — заказал {requester}"
-        # fire-and-forget; we don't await here to avoid blocking the player loop
-        try:
-            import asyncio
-            asyncio.get_event_loop().create_task(self.announce(msg))
-        except RuntimeError:
-            pass
+        self._fire(msg)
 
     def skipped(self, title: str) -> None:
-        msg = f"⏭ Трек пропущен: {title}"
-        try:
-            import asyncio
-            asyncio.get_event_loop().create_task(self.announce(msg))
-        except RuntimeError:
-            pass
+        self._fire(f"⏭ Трек пропущен: {title}")
 
     def refunded(self, title: str, requester: str, reason: str) -> None:
-        msg = f"↩ Возврат баллов: {title} ({requester}) — {reason}"
+        self._fire(f"↩ Возврат баллов: {title} ({requester}) — {reason}")
+
+    def _fire(self, message: str) -> None:
+        """Schedule announce() on the running event loop, if any."""
+        if not self.enabled:
+            return
         try:
-            import asyncio
-            asyncio.get_event_loop().create_task(self.announce(msg))
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.announce(message))
         except RuntimeError:
-            pass
+            # No running loop — message is dropped (acceptable for fire-and-forget)
+            logger.debug("Нет цикла событий, сообщение в чат пропущено: %s", message)
